@@ -5,6 +5,7 @@ import requests
 from collections import defaultdict
 from google.cloud import storage
 import time
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 import threading
 
@@ -14,10 +15,11 @@ filters = { "contentRating[]": ['safe','suggestive','erotica','pornographic']}
 
 token_refresh_lock = threading.Lock()
 bearer_token = None 
-
+last_token_time = None
 
 def authenticate(username, password, client_id, client_secret, grant_type = "password"):
-    global beaer
+    global bearer_token
+    global last_token_time
     url = "https://auth.mangadex.org/realms/mangadex/protocol/openid-connect/token"
     try:
         r = requests.post(url, 
@@ -35,12 +37,14 @@ def authenticate(username, password, client_id, client_secret, grant_type = "pas
                 bearer_token = data["access_token"]
 
             refresh = data["refresh_token"]   
+            last_token_time = datetime.now()
             return (bearer_token,refresh)
     except:
         print("error")
 
 def refresh(refresh_token, client_id, client_secret, grant_type ='refresh_token'):
     global bearer_token
+    global last_token_time
     url = 'https://auth.mangadex.org/realms/mangadex/protocol/openid-connect/token/auth/refresh'
     r = requests.post(url, 
         data = {
@@ -52,10 +56,19 @@ def refresh(refresh_token, client_id, client_secret, grant_type ='refresh_token'
     if r.status_code == 200:
         data = r.json()
         new_token = data["access_token"]
-
+        last_token_time = datetime.now()
         with token_refresh_lock:
             bearer_token = new_token
             
+def auto_refresh_token(refresh_token, client_id, client_secret):
+    global last_token_time, bearer_token
+    if datetime.now() - last_token_time > timedelta(minutes=10):
+        with token_refresh_lock:
+            # Double-checking the condition inside the lock
+            if datetime.now() - last_token_time > timedelta(minutes=10):
+                refresh(refresh_token, client_id, client_secret)
+
+
 # This section will be used to rename file to have the format:
 # 001, 002, since it is sorted by alphabetical order and we want the correct sorting.
 def pad_number(number_str, length=3):
@@ -203,33 +216,24 @@ def clean_and_sort(chapter_values):
 
 
 
-def refresh_token(refresh_token_function):
-    global bearer_token
-    with token_refresh_lock:
-        bearer_token = refresh_token_function()
-        print("Token refreshed")
-    return bearer_token
-
 def download_manga(chapter_values, manga_name, client_id, client_secret, refresh_token):
     global bearer_token
     base_url = "https://api.mangadex.org/at-home/server/{chapterID}"
-    base_file_name = "{manga_name}/{language}/{chapter}/{panel}.png"
+    base_file_name = "{manga_name}/{language}/{chapter}/{panel}.{type}"
 
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    with ThreadPoolExecutor(max_workers=7) as executor:
         futures = []
         for language in chapter_values:
             for chapter, id in chapter_values[language]:
                 print(f"Starting upload for {manga_name} in {language}, chapter: {chapter}")
+                auto_refresh_token(refresh_token, client_id, client_secret)
                 url = base_url.format(chapterID=id)
-
-                with token_refresh_lock:
-                    current_token = bearer_token
-
+                
                 try:
-                    response = requests.get(url=url, headers={"Authorization": f"Bearer {current_token}"})
+                    response = requests.get(url=url, headers={"Authorization": f"Bearer {bearer_token}"})
                     if response.status_code == 401:
-                        current_token = refresh(refresh_token, client_id, client_secret)
-                        response = requests.get(url=url, headers={"Authorization": f"Bearer {current_token}"})
+                        print('Error, status code == 401', 'will wait')
+                        time.sleep(14)
                 except Exception as e:
                     print(f"Error during request: {e}")
 
@@ -240,12 +244,14 @@ def download_manga(chapter_values, manga_name, client_id, client_secret, refresh
                     panels_list = data['chapter']['data']
 
                     for panel_num, panel in enumerate(panels_list):
-                        final_name = base_file_name.format(manga_name=manga_name, language=language, chapter=chapter, panel=pad_number(str(panel_num)))
+                        type = panel.split('.')[-1]
+                        final_name = base_file_name.format(manga_name=manga_name, language=language, chapter=chapter, panel=pad_number(str(panel_num)),type=type)
                         future = executor.submit(upload_to_gcloud, "manga_dataset_py", base + "/data/" + hash + "/" + panel, final_name, client_id, client_secret, refresh_token)
                         futures.append(future)
 
         for future in futures:
             future.result()  # Wait for all uploads to complete
+            # print(f"Chapter upload completed for {manga_name} in {language}")
 
     return None
 
@@ -256,19 +262,24 @@ def upload_to_gcloud(bucket_name, manga_url, destination_blob_name, client_id, c
     blob = bucket.blob(destination_blob_name)
     blob.content_type = 'image/png'
 
+    auto_refresh_token(refresh, client_id, client_secret)
+
     hardcoded_stop = 1
     while hardcoded_stop <= 10:
         try:
-            with token_refresh_lock:
-                current_token = bearer_token
-            response = requests.get(manga_url, stream=True, headers={"Authorization": f"Bearer {current_token}"})
+
+
+            response = requests.get(manga_url, stream=True, headers={"Authorization": f"Bearer {bearer_token}"})
             if response.status_code == 200:
                 blob.upload_from_string(response.content, content_type="image/png")
                 break
             elif response.status_code == 401:  # Token might be expired
-                current_token = refresh(refresh_token, client_id, client_secret)
+                print('error in upload_to_gcloud')
+                auto_refresh_token(refresh_token, client_id, client_secret)
+                time.sleep(2**hardcoded_stop)
             else:
                 print(f"Failed to retrieve manga panel from {manga_url} - Status Code: {response.status_code}")
+                time.sleep(hardcoded_stop**2)
 
         except Exception as e:
             print(f"Error (rate_limited): {e}")
