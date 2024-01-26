@@ -79,7 +79,7 @@ def decode_predictions(scores,geometry):
         for col in range(numCols):
           (offsetX, offsetY) = (col * 4.0, row * 4.0)
 
-          if scoresData[col] > 0.4:
+          if scoresData[col] > 0.6:
             height = yData0[col] + yData2[col]
             width = xData1[col] + xData3[col]
             angle = anglesData[col]
@@ -92,59 +92,143 @@ def decode_predictions(scores,geometry):
             startY = int(endY - height)
             rects.append((startX, startY, endX, endY))
             confidences.append(scoresData[col])
-
             
 
     return (rects,confidences)
 
+def resize_image_for_east(image):
+    (h, w) = image.shape[:2]
+
+    # Calculate the nearest multiple of 32 for both dimensions
+    new_w = (w // 32) * 32
+    new_h = (h // 32) * 32
+
+    # If the dimension is already a multiple of 32, no need to resize
+    if new_w == w and new_h == h:
+        return image
+
+    # Maintain aspect ratio
+    ratio_w = new_w / w
+    ratio_h = new_h / h
+    ratio = min(ratio_w, ratio_h)
+
+    # Compute new dimensions
+    new_dim = (int(w * ratio), int(h * ratio))
+
+    # Resize the image
+    resized_image = cv2.resize(image, new_dim, interpolation=cv2.INTER_AREA)
+
+    # Pad the resized image to reach the nearest multiple of 32
+    delta_w = max(new_w - resized_image.shape[1], 0)
+    delta_h = max(new_h - resized_image.shape[0], 0)
+    top, bottom = delta_h // 2, delta_h - (delta_h // 2)
+    left, right = delta_w // 2, delta_w - (delta_w // 2)
+
+    color = [0, 0, 0]  # Black padding
+    padded_image = cv2.copyMakeBorder(resized_image, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
+
+    return padded_image
+
+def merge_boxes(boxes, threshold=10):
+    # Sort the boxes by their starting x coordinate to improve the merging process
+    boxes = [list(box) for box in boxes]
+    boxes = sorted(boxes, key=lambda x: x[0])
+    merged_boxes = []
+
+    while boxes:
+        # Take the first box
+        base = boxes.pop(0)
+
+        # This will contain all the boxes to merge with the current one
+        to_merge = [base]
+
+        # Compare it with the rest of the boxes
+        for other in boxes:
+            # If boxes are close enough (based on some threshold), consider them for merging
+            if (abs(other[0] - base[2]) <= threshold and abs(other[1] - base[3]) <= threshold and
+                abs(base[0] - other[2]) <= threshold and abs(base[1] - other[3]) <= threshold):
+                to_merge.append(other)
+
+        # Remove the boxes that will be merged
+        boxes = [b for b in boxes if b not in to_merge]
+
+        # Calculate the new bounding box coordinates
+        min_startX = min([b[0] for b in to_merge])
+        min_startY = min([b[1] for b in to_merge])
+        max_endX = max([b[2] for b in to_merge])
+        max_endY = max([b[3] for b in to_merge])
+
+        # Add the new box to the merged_boxes
+        merged_boxes.append([min_startX, min_startY, max_endX, max_endY])
+
+    return merged_boxes
+
 def detect_text_regions(image_path: str):
     
-    image = preprocess_for_east_color(image_path)
+    image = cv2.imread(image_path)
     orig = image.copy()
+    orig_annotated = image.copy()
+    image = resize_image_for_east(image)
 
     # EAST requires images of a specific height and width
-    (H, W) = image.shape[:2]
-    # Your chosen dimensions (multiple of 32)
-    newW = 320
-    newH = 320
-    rW = W / float(newW)
-    rH = H / float(newH)
-
-    # Resize the image and grab the new image dimensions
-    image = cv2.resize(image, (newW, newH))
-    (H, W) = image.shape[:2]
+    (newH, newW) = image.shape[:2]
+    (oldH, oldW) = orig.shape[:2]
+    rW = oldW / float(newW)
+    rH = oldH / float(newH)
+    
 
     # Load the pre-trained EAST text detector
     east_model_path = 'frozen_east_text_detection.pb'  
     net = cv2.dnn.readNet(east_model_path)
 
     # Construct a blob from the image
-    blob = cv2.dnn.blobFromImage(image, 1.0, (W, H),(123.68, 116.78, 103.94), swapRB=True, crop=False)
+    blob = cv2.dnn.blobFromImage(image, 1.0, (newW, newH),(123.68, 116.78, 103.94), swapRB=True, crop=False)
     net.setInput(blob)
     (scores, geometry) = net.forward(["feature_fusion/Conv_7/Sigmoid", "feature_fusion/concat_3"])
 
     # Decode the predictions, then apply non-maxima suppression to suppress weak, overlapping bounding boxes
     # (Implement the decode_predictions function based on EAST model's output)
     rectangles, confidences = decode_predictions(scores, geometry)
-    nms_threshold = 0.1  # Adjust as necessary
+    nms_threshold = 0.1 # Adjust as necessary
     boxes = non_max_suppression(np.array(rectangles), probs=confidences, overlapThresh = nms_threshold)
 
     text_regions = []
+    expansion = 5
     for (startX, startY, endX, endY) in boxes:
         # Scale the bounding box coordinates based on the respective ratios
-        startX = int(startX * rW)
-        startY = int(startY * rH)
-        endX = int(endX * rW)
-        endY = int(endY * rH)
-
+        startX = int(startX * rW) - expansion
+        startY = int(startY * rH) - expansion
+        endX = int(endX * rW) + expansion
+        endY = int(endY * rH) + expansion
         # Extract the actual padded ROI
         text_regions.append(orig[startY:endY, startX:endX])
 
+    merged_boxes = merge_boxes(boxes, threshold=10)
+    for startX, startY, endX, endY in merged_boxes:
+        cv2.rectangle(orig_annotated, (startX, startY), (endX, endY), (0, 255, 0), 2)
+
+    # for (box, score) in zip(boxes, confidences):
+    #     # Scale the bounding box coordinates based on the respective ratios
+    #     (startX, startY, endX, endY) = box
+    #     startX = int(startX * rW)
+    #     startY = int(startY * rH)
+    #     endX = int(endX * rW)
+    #     endY = int(endY * rH)
+
+    #     # Put the probability text on the image
+    #     text = "{:.4f}".format(score)
+    #     cv2.putText(orig, text, (startX, startY - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+    # Display the output image with probabilities
+    cv2.imshow("Text Detection with Probabilities", orig_annotated)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
     
+
     # for i in range(len(text_regions)):
     #     text_regions[i] = preprocess_image(text_regions[i])
         
 
-    return text_regions
+    return merged_boxes
 
 
