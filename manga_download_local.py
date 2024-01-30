@@ -2,27 +2,39 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from manga_collector import *
 
+import logging
+
+# Basic configuration for logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+
 def download_manga_local(chapter_values, manga_name, client_id, client_secret, refresh_token, base_directory):
     global bearer_token
     base_url = "https://api.mangadex.org/at-home/server/{chapterID}"
     base_file_name = "{manga_name}/{language}/{chapter}/{panel}.{type}"
 
 
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = []
 
-        for language in chapter_values:
+    for language in chapter_values:
+        with ThreadPoolExecutor(max_workers=10) as executor:
             for chapter, id in chapter_values[language]:
-                print(f"Starting download for {manga_name} in {language}, chapter: {chapter}")
+                futures = []
+                print(chapter)
+                # print(f"Starting download for {manga_name} in {language}, chapter: {chapter}")
                 auto_refresh_token(refresh_token, client_id, client_secret)
                 url = base_url.format(chapterID=id)
-                try:
-                    response = requests.get(url=url, headers={"Authorization": f"Bearer {bearer_token}"})
-                    if response.status_code == 401:
-                        print('Error, status code == 401')
-                        time.sleep(14)
-                except Exception as e:
-                    print(f"Error during request: {e}")
+                
+                retry = 1
+                while retry < 10:
+                    try:
+                        response = requests.get(url=url, headers={"Authorization": f"Bearer {bearer_token}"})
+                        if response.status_code == 401:
+                            print('Error, status code == 401')
+                            time.sleep(14)
+                        break
+                    except Exception as e:
+                        print(f"Error during request: {e}")
+                    retry +=1
 
                 if response.status_code == 200 and response.text:
                     data = response.json()
@@ -34,32 +46,40 @@ def download_manga_local(chapter_values, manga_name, client_id, client_secret, r
                         type = panel.split('.')[-1]
                         final_name = base_file_name.format(manga_name=manga_name, language=language, chapter=chapter, panel=pad_number(str(panel_num)),type=type)
                         final_path = os.path.join(base_directory, final_name)
+                        logging.info(f"Submitting download task for {manga_name}, Chapter: {chapter}, Panel: {panel_num} to executor")
                         future = executor.submit(save_to_local, base + "/data/" + hash + "/" + panel, final_path, bearer_token, refresh_token, client_id, client_secret)
                         futures.append(future)
 
-        for future in futures:
-            future.result()
+                for future in futures:
+                    future.result()
+                futures.clear()
 
 def save_to_local(url, file_path, bearer_token, refresh_token, client_id, client_secret):
     auto_refresh_token(refresh_token, client_id, client_secret)
-    hardcoded_stop = 0
-    while hardcoded_stop<=5:
+    hardcoded_stop = 1
+    while hardcoded_stop<=6:
         try:
             response = requests.get(url, headers={"Authorization": f"Bearer {bearer_token}"})
 
-            hardcoded_stop+=1
+           
             if response.status_code == 200:
                 os.makedirs(os.path.dirname(file_path), exist_ok=True)  # Create the directory if it does not exist
                 with open(file_path, 'wb') as file:
                     file.write(response.content)
+                    # print(f"Saved to {file_path}")
+                
+                break
             else:
                 print(f"Failed to download file from {url}" + " " + str(response.status_code))
-                time.sleep(7)
+                time.sleep(2**hardcoded_stop)
         except:
-            time.sleep(6)
+            print("error in requests")
+            time.sleep(2**hardcoded_stop)
+
+        hardcoded_stop+=1
 
 def upload_from_local_file(upload_name, local_file, bucket):
-    # Function to uplaod to GCS from a local folder. Note each folder here represents 1 chapter and contains the panels for that chapter
+    # Function to upload to GCS from a local folder. Note each folder here represents 1 chapter and contains the panels for that chapter
     # We will use threading later on to upload multiple
     blob = bucket.blob(upload_name)
     blob.content_type = 'image/png'
